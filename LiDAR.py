@@ -1,84 +1,88 @@
- import asyncio
+import serial
+import time
+import threading
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from rplidarc1 import RPLidar
 
-# --- Настройки ---
-PORT = "/dev/ttyUSB0"
+PORT = '/dev/ttyUSB0'
 BAUD = 460800
-MAX_DIST = 6000   # 6 метров, как в RoboStudio
+MAX_DIST = 6000
 
-async def main():
-    lidar = RPLidar(PORT, BAUD)
+# --- общий буфер между потоками ---
+scan_points = []
+lock = threading.Lock()
+running = True
 
-    # --- Настройка окна ---
-    plt.ion()
-    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(8, 8))
-    ax.set_theta_zero_location('N')
-    ax.set_theta_direction(-1)
-    ax.set_ylim(0, MAX_DIST)
-    ax.set_yticks([1000, 2000, 3000, 4000, 5000, 6000])
-    ax.set_title('RPLIDAR C1 — до 6 м')
-    scatter = ax.scatter([], [], s=8, c='red')
-    fig.canvas.draw()
-    fig.canvas.flush_events()
+# --- поток чтения ---
+def reader_thread():
+    global running
+    ser = serial.Serial(PORT, BAUD, timeout=1)
+    time.sleep(0.5)
+    ser.reset_input_buffer()
+    ser.write(bytes([0xA5, 0x20]))
+    print("Ответ:", ser.read(7).hex())
 
-    print("Начинаю сканирование...")
-
-    frames = 0
-
-    while True:
-        # Очищаем словарь перед новым кадром
-        lidar.stop_event.clear()
-        if lidar.output_dict is not None:
-            lidar.output_dict.clear()
-
-        # Запускаем сбор данных в фоне
-        scan_task = asyncio.create_task(
-            lidar.simple_scan(make_return_dict=True)
-        )
-
-        # Ждём 0.5 сек — этого хватит на несколько оборотов лидара
-        await asyncio.sleep(0.5)
-
-        # Останавливаем сбор
-        lidar.stop_event.set()
-
-        # Даём задаче завершиться
-        try:
-            await asyncio.wait_for(scan_task, timeout=1.0)
-        except (asyncio.TimeoutError, Exception):
-            pass
-
-        # Проверяем, есть ли данные
-        if not lidar.output_dict:
-            print("Данных пока нет...")
-            await asyncio.sleep(0.1)
+    while running:
+        data = ser.read(5)
+        if len(data) != 5:
             continue
+        b0, b1, b2, b3, b4 = data
+        if (b0 & 0x01) != ((b0 >> 1) & 0x01):
+            continue
+        quality = b0 >> 2
+        angle = ((b1 >> 1) | (b2 << 7)) / 64.0
+        distance = (b3 | (b4 << 8)) / 4.0
+        if 100 < distance < MAX_DIST and quality > 20:
+            with lock:
+                scan_points.append((angle, distance))
 
-        # --- Достаём точки из словаря ---
-        angles = []
-        dists = []
-        for angle_deg, data in lidar.output_dict.items():
-            d = data.get('d_mm', 0)
-            q = data.get('q', 0)
-            if 100 < d < MAX_DIST and q > 20:
-                angles.append(np.radians(angle_deg))
-                dists.append(d)
+    ser.write(bytes([0xA5, 0x25]))
+    ser.close()
+    print("Порт закрыт.")
 
-        # --- Обновляем график ---
-        if angles:
+# --- запускаем чтение в фоне ---
+t = threading.Thread(target=reader_thread, daemon=True)
+t.start()
+
+# --- главный поток: только рисуем ---
+plt.ion()
+fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(8, 8))
+ax.set_theta_zero_location('N')
+ax.set_theta_direction(-1)
+ax.set_ylim(0, MAX_DIST)
+ax.set_yticks([1000, 2000, 3000, 4000, 5000, 6000])
+ax.set_title('RPLIDAR C1')
+scatter = ax.scatter([], [], s=5, c='red')
+fig.canvas.draw()
+fig.canvas.flush_events()
+
+print("Пошло. Ctrl+C для выхода")
+
+frames = 0
+
+try:
+    while True:
+        # раз в 1 секунду берём снимок буфера и рисуем
+        time.sleep(1.0)
+
+        with lock:
+            snapshot = list(scan_points)
+            scan_points.clear()
+
+        if snapshot:
+            angles = np.radians([p[0] for p in snapshot])
+            dists = [p[1] for p in snapshot]
             scatter.set_offsets(np.column_stack([angles, dists]))
             frames += 1
-            ax.set_title(f'RPLIDAR C1 — кадр {frames}, точек: {len(angles)}')
+            ax.set_title(f'RPLIDAR C1 — кадр {frames}, точек: {len(snapshot)}')
             fig.canvas.draw_idle()
             fig.canvas.flush_events()
-            print(f"Кадр {frames}: {len(angles)} точек")
+            print(f"Кадр {frames}: {len(snapshot)} точек")
 
-        await asyncio.sleep(0.05)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nОстановлено пользователем.")
+except KeyboardInterrupt:
+    print("\nСтоп")
+finally:
+    running = False
+    time.sleep(0.3)               
